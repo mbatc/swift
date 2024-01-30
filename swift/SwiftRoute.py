@@ -3,9 +3,8 @@
 @author Jesse Haviland
 """
 
-
+import platform
 import swift as sw
-import websockets
 import asyncio
 from threading import Thread
 import webbrowser as wb
@@ -19,9 +18,15 @@ from http import HTTPStatus
 import urllib
 from typing import Union
 
-
 from queue import Queue
 from typing_extensions import Literal as L
+
+try:
+    import websockets
+
+    WS = True
+except ImportError:
+    WS = False
 
 # Check for notebook support
 try:
@@ -53,6 +58,76 @@ try:
 except ImportError:
     COLAB = False
 
+try:
+    import pyjs
+
+    PYJS = True
+except ImportError:
+    PYJS = False
+
+if platform.system() == "Emscripten":
+    THREADS = False
+else:
+    THREADS = True
+
+def __start_rtc_comms(outq, inq):
+    if not RTC:
+        print(
+            "\rrtc comms not are supported on this platform\n"
+        )
+        raise
+
+    # Start the RTC server
+    socket = Thread(
+        target=SwiftRtc,
+        args=(
+            outq,
+            inq,
+        ),
+        daemon=True,
+    )
+    socket.start()
+
+    socket_port = 1 if COLAB else 0
+
+    return socket, socket_port
+
+def __start_websocket_comms(outq, inq, stop_servers):
+    if not WS:
+        print(
+            "\nWebsockets comms are not supported on this platform\n"
+        )
+        raise
+
+    # Start our websocket server with a new port
+    socket = Thread(
+        target=SwiftSocket,
+        args=(
+            outq,
+            inq,
+            stop_servers,
+        ),
+        daemon=True,
+    )
+
+    socket.start()
+    socket_port = inq.get()
+
+    return socket, socket_port
+
+def __start_pyjs_comms(outq, inq, run):
+    if not PYJS:
+        print(
+            "\npyjs comms are not supported on this platform\n"
+        )
+        raise
+
+    running_loop = asyncio.get_running_loop()
+
+    pyjs.js.console.log("Hello from pyjs")
+    pyjs.js.console.log(f"Running loop is: {running_loop}")
+
+    return SwiftPyJS(outq, inq, run), None
 
 def start_servers(
     outq: Queue,
@@ -60,36 +135,20 @@ def start_servers(
     stop_servers,
     open_tab: bool = True,
     browser: Union[str, None] = None,
-    comms: L["websocket", "rtc"] = "websocket",
+    comms: L["websocket", "rtc", "pyjs"] = "websocket",
 ):
     # We are going to attempt to set up an RTC connection
-
     if comms == "rtc":
-        # Start the RTC server
-        socket = Thread(
-            target=SwiftRtc,
-            args=(
-                outq,
-                inq,
-            ),
-            daemon=True,
-        )
-        socket.start()
+        socket, socket_port = __start_rtc_comms(outq, inq)
+    elif comms == "pyjs":
+        socket, server = __start_pyjs_comms(outq, inq, stop_servers)
 
-        socket_port = 1 if COLAB else 0
+        loop = asyncio.get_running_loop()
+        serve_task = loop.create_task(socket.serve())
+
+        return serve_task, None
     else:
-        # Start our websocket server with a new port
-        socket = Thread(
-            target=SwiftSocket,
-            args=(
-                outq,
-                inq,
-                stop_servers,
-            ),
-            daemon=True,
-        )
-        socket.start()
-        socket_port = inq.get()
+        socket, socket_port = __start_websocket_comms(outq, inq, stop_servers)
 
     # Start a http server
     server = Thread(
@@ -433,3 +492,101 @@ class SwiftServer:
                     httpd.serve_forever()
             except OSError:
                 server_port += 1
+
+
+class SwiftPyJS:
+    def __init__(self, outq, inq, run, url = './swift/index.html', target_element_id = 'swift-viewport', entry_point = '_bindSwiftMessageHandlers'):
+        self._cb_on_open = None
+        self._cb_on_close = None
+        self._cb_on_message = None
+
+        self.run  = run
+        self.outq = outq
+        self.inq  = inq
+        self.is_connected = False
+        
+        self._init_hooks(url, target_element_id, entry_point)
+
+    async def serve(self):
+        # Wait for callbacks to be bound
+        while not self.is_connected and self.run():
+            await asyncio.sleep(0.5)
+
+        if not self.run():
+            return
+
+        pyjs.js.console.log('SwiftPyJS comms are running')
+
+        # Invoke on open callback
+        if self._cb_on_open is not None:
+            self._cb_on_open()
+
+        # Now onto send, recieve cycle
+        while self.run():
+            message = await self.producer()
+            pyjs.js.console.log(f'recieved message: {message}')
+            try:
+              expected = message[0]
+              msg      = message[1]
+              if self._cb_on_message is not None:
+                recieved = pyjs.to_py(self._cb_on_message(json.dumps(msg)))
+                if expected:
+                    pyjs.js.console.log(f'sending response: {recieved}')
+                    await self.inq.put(str(recieved))
+              else:
+                pyjs.js.console.log('Discarding message as no "on_message" callback has been bound')
+            except Exception as e:
+              pyjs.js.console.warn(e)
+
+        pyjs.js.console.log('SwiftPyJS comms are stopping')
+
+        if self._cb_on_close is not None:
+            self._cb_on_close()
+
+
+    async def producer(self):
+        data = self.outq.get()
+        if asyncio.iscoroutine(data):
+          return await data
+        else:
+          return data
+
+    @staticmethod
+    def make_js_func(py_func):
+        """
+        Wrap a python function in a function instance that is
+        callable from JavaScript
+        """
+        handle = pyjs.JsValue(py_func)
+        f = handle.py_call.bind(handle)
+        return f, handle
+
+    async def bind_message_handlers(self, on_open, on_close, on_message):
+        self._cb_on_open    = on_open
+        self._cb_on_close   = on_close
+        self._cb_on_message = on_message
+        self.is_connected   = True # Start processing messages
+
+        pyjs.js.console.log("Swift message handlers have been bound")
+
+    def _init_hooks(self, url, target_element_id, entry_point):
+        cb, handle = SwiftPyJS.make_js_func(self.bind_message_handlers)
+        if pyjs.js.window is not None:
+          pyjs.js.window[entry_point] = cb
+          pyjs.js.console.log(f"Entry point bound to window.{entry_point}")
+        elif pyjs.js.globalThis is not None:
+          pyjs.js.globalThis[entry_point] = cb
+          pyjs.js.console.log(f"Entry point bound to globalThis.{entry_point}")
+        else:
+          pyjs.js.console.warn("Could not bind entry point. 'window' and 'globalThis' were null")
+
+        target = pyjs.js.document.getElementById(target_element_id)
+
+        if target == None:
+          pyjs.js.console.warn(f"Could not init comms. Target element 'id={target_element_id}' does not exist")
+          return None
+
+        new_element = pyjs.js.document.createElement("iframe")
+        new_element.id = target_element_id
+        new_element.setAttribute("src", url + f"?pyjs.{entry_point}")
+        target.replaceWith(new_element)

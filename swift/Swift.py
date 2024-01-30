@@ -3,6 +3,8 @@
 @author Jesse Haviland
 """
 
+import pyjs
+
 from os import read
 import numpy as np
 import spatialmath as sm
@@ -14,7 +16,7 @@ from swift import start_servers, SwiftElement, Button
 from swift.phys import step_v, step_shape
 from typing import Union
 from typing_extensions import Literal as L
-
+import asyncio
 
 rtb = None
 
@@ -55,10 +57,14 @@ class Swift:
     """
 
     def __init__(self, _dev=False):
-        self.outq = Queue()
-        self.inq = Queue()
+        self.outq = None
+        self.inq = None
 
         self._dev = _dev
+
+        self.socket    = None
+        self.server    = None
+        self.last_time = 0.0
 
         if rtb is None:
             _import_rtb()
@@ -121,7 +127,7 @@ class Swift:
         headless: bool = False,
         rate: int = 60,
         browser: Union[str, None] = None,
-        comms: L["websocket", "rtc"] = "websocket",
+        comms: L["websocket", "rtc", "pyjs"] = "websocket",
         **kwargs,
     ):
         """
@@ -157,11 +163,23 @@ class Swift:
         self.rate = rate
         self.realtime = realtime
         self.headless = headless
-
+        
+        threaded = True
+        
         if comms == "rtc":
             self._comms = "rtc"
+        elif comms == "pyjs":
+            self._comms = "pyjs"
+            threaded = False
         else:
             self._comms = "websocket"
+
+        if threaded:
+            self.outq = Queue()
+            self.inq  = Queue()
+        else:
+            self.outq = asyncio.Queue()
+            self.inq  = asyncio.Queue()
 
         if not self.headless:
             # The realtime, render and pause buttons
@@ -183,12 +201,16 @@ class Swift:
 
     def _stop_threads(self):
         self._run_thread = False
-        if not self.headless:
-            self.socket.join(1)
-        if not self._dev:
+        if not self.headless and self.socket is not None:
+            if isinstance(self.socket, Thread):
+                self.socket.join(1)
+            elif isinstance(self.socket, asyncio.Task):
+                self.socket.cancel()
+
+        if not self._dev and self.server is not None:
             self.server.join(1)
 
-    def step(self, dt=0.05, render=True):
+    async def step(self, dt=0.05, render=True):
         """
         Update the graphical scene
 
@@ -216,11 +238,14 @@ class Swift:
         # TODO how is the pose of shapes updated prior to step?
 
         # Update local pose of objects
+        steps = []
         for i, obj in enumerate(self.swift_objects):
             if isinstance(obj, Shape):
-                self._step_shape(obj, dt)
+                steps.append(self._step_shape(obj, dt))
             elif isinstance(obj, rtb.Robot):
                 self._step_robot(obj, dt, self.swift_options[i]["readonly"])
+
+        await asyncio.gather(*steps)
 
         # Update world transform of objects
         for obj in self.swift_objects:
@@ -241,7 +266,7 @@ class Swift:
                     self._skipped = 1
 
                     if diff > 0:
-                        time.sleep(diff)
+                        await asyncio.sleep(diff)
 
                     self.last_time = time.time()
                 elif (time.time() - self._laststep) < self._period:
@@ -251,9 +276,9 @@ class Swift:
 
                 self._laststep = time.time()
 
-                self._step_elements()
+                await self._step_elements()
 
-                events = self._draw_all()
+                events = await self._draw_all()
                 # print(events)
 
                 # Process GUI events
@@ -263,7 +288,7 @@ class Swift:
                 if (time.time() - self._laststep) < self._notrenderperiod:
                     return
                 self._laststep = time.time()
-                events = json.loads(self._send_socket("shape_poses", [], True))
+                events = json.loads(await self._send_socket("shape_poses", [], True))
                 self.process_events(events)
 
             # print(events)
@@ -271,7 +296,7 @@ class Swift:
             #     for i in range(len(self.robots)):
             #         self.robots[i]['ob'].fkine_all(self.robots[i]['ob'].q)
 
-            self._send_socket("sim_time", self.sim_time, expected=False)
+            await self._send_socket("sim_time", self.sim_time, expected=False)
 
     def reset(self):
         """
@@ -285,7 +310,7 @@ class Swift:
 
         self.restart()
 
-    def restart(self):
+    async def restart(self):
         """
         Restart the graphics display
 
@@ -295,7 +320,7 @@ class Swift:
 
         """
 
-        self._send_socket("close", "0", False)
+        await self._send_socket("close", "0", False)
         self._stop_threads()
         self._init()
         self.launch(
@@ -305,7 +330,7 @@ class Swift:
             browser=self.browser,
         )
 
-    def close(self):
+    async def close(self):
         """
         Close the graphics display
 
@@ -313,14 +338,14 @@ class Swift:
         referenced by ``env``.
         """
 
-        self._send_socket("close", "0", False)
+        await self._send_socket("close", "0", False)
         self._stop_threads()
 
     #
     #  Methods to interface with the robots created in other environemnts
     #
 
-    def add(self, ob, robot_alpha=1.0, collision_alpha=0.0, readonly=False):
+    async def add(self, ob, robot_alpha=1.0, collision_alpha=0.0, readonly=False):
         """
         Add a robot to the graphical scene
 
@@ -356,10 +381,10 @@ class Swift:
             ob._propogate_scene_tree()
             ob._added_to_swift = True
             if not self.headless:
-                id = int(self._send_socket("shape", [ob.to_dict()]))
+                id = int(await self._send_socket("shape", [ob.to_dict()]))
 
-                while not int(self._send_socket("shape_mounted", [id, 1])):
-                    time.sleep(0.1)
+                while not int(await self._send_socket("shape_mounted", [id, 1])):
+                    await asyncio.sleep(0.1)
 
             else:
                 id = len(self.swift_objects)
@@ -379,7 +404,7 @@ class Swift:
             self.elements[str(id)] = ob
             ob._id = id
 
-            self._send_socket("element", ob.to_dict())
+            await self._send_socket("element", ob.to_dict())
         elif isinstance(ob, rtb.Robot):
 
             # if ob.base is None:
@@ -400,10 +425,10 @@ class Swift:
                 robob = ob._to_dict(
                     robot_alpha=robot_alpha, collision_alpha=collision_alpha
                 )
-                id = self._send_socket("shape", robob)
+                id = await self._send_socket("shape", robob)
 
-                while not int(self._send_socket("shape_mounted", [id, len(robob)])):
-                    time.sleep(0.1)
+                while not int(await self._send_socket("shape_mounted", [id, len(robob)])):
+                    await asyncio.sleep(0.1)
 
             else:
                 id = len(self.swift_objects)
@@ -418,7 +443,7 @@ class Swift:
 
             return int(id)
 
-    def remove(self, id):
+    async def remove(self, id):
         """
         Remove a robot/shape from the graphical scene
 
@@ -453,7 +478,7 @@ class Swift:
                 "the id argument does not correspond with a robot or shape in Swift"
             )
 
-        self._send_socket(code, idd)
+        await self._send_socket(code, idd)
 
     def hold(self):  # pragma: no cover
         """
@@ -465,7 +490,7 @@ class Swift:
         while True:
             time.sleep(1)
 
-    def start_recording(self, file_name, framerate, format="webm"):
+    async def start_recording(self, file_name, framerate, format="webm"):
         """
         Start recording the canvas in the Swift simulator
 
@@ -490,14 +515,14 @@ class Swift:
             raise ValueError("Format can one of 'webm', 'gif', 'png', or 'jpg'")
 
         if not self.recording:
-            self._send_socket("start_recording", [framerate, file_name, format])
+            await self._send_socket("start_recording", [framerate, file_name, format])
             self.recording = True
         else:
             raise ValueError(
                 "You are already recording, you can only record one video at a time"
             )
 
-    def stop_recording(self):
+    async def stop_recording(self):
         """
         Start recording the canvas in the Swift simulator. This is optional
         as the video will be automatically saved when the python script exits
@@ -507,14 +532,14 @@ class Swift:
         """
 
         if self.recording:
-            self._send_socket("stop_recording")
+            await self._send_socket("stop_recording")
         else:
             raise ValueError(
                 "You must call swift.start_recording(file_name) before trying"
                 " to stop the recording"
             )
 
-    def screenshot(self, file_name="swift_snap"):
+    async def screenshot(self, file_name="swift_snap"):
         """
         Save a screenshot of the current Swift frame as a png file
 
@@ -527,7 +552,7 @@ class Swift:
         if file_name.endswith(".png"):
             file_name = file_name[:-4]
 
-        self._send_socket("screenshot", [file_name])
+        await self._send_socket("screenshot", [file_name])
 
     def process_events(self, events):
         """
@@ -541,7 +566,7 @@ class Swift:
             self.elements[event].update(events[event])
             self.elements[event].cb(events[event])
 
-    def set_camera_pose(self, position, look_at):
+    async def set_camera_pose(self, position, look_at):
         """
         Swift.set_camera_pose(position, look_at) will set the camera
         position and orientation of the camera within the swift scene.
@@ -574,7 +599,7 @@ class Swift:
             "look_at": look_at,
         }
 
-        self._send_socket("camera_pose", transform, False)
+        await self._send_socket("camera_pose", transform, False)
 
     def _step_robot(self, robot, dt, readonly):
 
@@ -609,12 +634,12 @@ class Swift:
         # Update the robot link transofrms based on the new q
         robot._update_link_tf()
 
-    def _step_shape(self, shape, dt):
+    async def _step_shape(self, shape, dt):
 
         if shape._changed:
             shape._changed = False
             id = self.swift_objects.index(shape)
-            self._send_socket("shape_update", [id, shape.to_dict()])
+            await self._send_socket("shape_update", [id, shape.to_dict()])
 
         step_shape(
             dt, shape.v, shape._SceneNode__T, shape._SceneNode__wT, shape._SceneNode__wq
@@ -625,7 +650,7 @@ class Swift:
         # shape._sT[:] = shape._wT @ shape._base
         # shape._sq[:] = sm.base.r2q(shape._sT[:3, :3], order="xyzs")
 
-    def _step_elements(self):
+    async def _step_elements(self):
         """
         Check custom HTML elements to see if any have been updated, if there
         are any updates, send them through to Swift.
@@ -634,11 +659,11 @@ class Swift:
         for element in self.elements:
             if self.elements[element]._changed:
                 self.elements[element]._changed = False
-                self._send_socket(
+                await self._send_socket(
                     "update_element", self.elements[element].to_dict(), False
                 )
 
-    def _draw_all(self):
+    async def _draw_all(self):
         """
         Sends the transform of every simulated object in the scene
         Recieves bacl a list of events which has occured
@@ -661,24 +686,24 @@ class Swift:
                         ]
                     )
 
-        events = self._send_socket("shape_poses", msg, True)
+        events = await self._send_socket("shape_poses", msg, True)
         return json.loads(events)
 
-    def _send_socket(self, code, data=None, expected=True):
+    async def _send_socket(self, code, data=None, expected=True):
         msg = [expected, [code, data]]
 
-        self.outq.put(msg)
+        await self.outq.put(msg)
 
         if expected:
-            return self.inq.get()
+            return await self.inq.get()
         else:
             return "0"
 
-    def _pause_control(self, paused):
+    async def _pause_control(self, paused):
         # Must hold it here until unpaused
         while paused:
             time.sleep(0.1)
-            events = json.loads(self._send_socket("shape_poses", []))
+            events = json.loads(await self._send_socket("shape_poses", []))
 
             if "0" in events and not events["0"]:
                 paused = False
