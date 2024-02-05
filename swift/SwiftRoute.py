@@ -529,10 +529,7 @@ class SwiftPyJS:
               expected = message[0]
               msg      = message[1]
               if self._cb_on_message is not None:
-                recieved = pyjs.to_py(self._cb_on_message(json.dumps(msg)))
-                if expected:
-                    pyjs.js.console.log(f'sending response: {recieved}')
-                    await self.inq.put(str(recieved))
+                self._cb_on_message(json.dumps(msg))
               else:
                 pyjs.js.console.log('Discarding message as no "on_message" callback has been bound')
             except Exception as e:
@@ -561,13 +558,21 @@ class SwiftPyJS:
         f = handle.py_call.bind(handle)
         return f, handle
 
-    async def bind_message_handlers(self, on_open, on_close, on_message):
+    async def on_recv(self, data):
+        recieved = pyjs.to_py(data)
+        await self.inq.put(str(recieved))
+
+    def bind_message_handlers(self, on_open, on_close, on_message):
         self._cb_on_open    = on_open
         self._cb_on_close   = on_close
         self._cb_on_message = on_message
         self.is_connected   = True # Start processing messages
 
         pyjs.js.console.log("Swift message handlers have been bound")
+
+        cb, handle = SwiftPyJS.make_js_func(self.on_recv)
+
+        return cb
 
     def _init_hooks(self, url, target_element_id, entry_point):
         cb, handle = SwiftPyJS.make_js_func(self.bind_message_handlers)
