@@ -1,12 +1,12 @@
 // @ts-check
 
 const {
-  SWIFT_PATH
+  NEXT_SWIFT_BASE_PATH
 } = process.env;
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  basePath: SWIFT_PATH === undefined ? "/swift" : SWIFT_PATH, // TODO: use env to set this?
+  basePath: NEXT_SWIFT_BASE_PATH === undefined ? "/swift" : NEXT_SWIFT_BASE_PATH,
   productionBrowserSourceMaps: true,
 }
 
